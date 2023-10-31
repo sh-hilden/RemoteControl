@@ -24,6 +24,7 @@ public class RelayCommand : ICommand
     }
 
     public event EventHandler? CanExecuteChanged;
+
     public bool CanExecute(object? parameter)
     {
         return _canExecute.Invoke();
@@ -32,6 +33,11 @@ public class RelayCommand : ICommand
     public void Execute(object? parameter)
     {
         _execute.Invoke();
+    }
+
+    public void NotifyCanExecuteChanged()
+    {
+        CanExecuteChanged?.Invoke(this, EventArgs.Empty);
     }
 }
 
@@ -63,7 +69,10 @@ public class RelayCommand<T> : ICommand
 
         if (parameter is not T typedParam)
         {
-            throw new InvalidOperationException("Paramter is not of the correct type.");
+            throw new InvalidOperationException(
+                "Parameter is not of the correct type.  " +
+                $"Expected type {typeof(T)}.  " +
+                $"Received type {parameter.GetType()}.");
         }
 
         return _canExecute.Invoke(typedParam);
@@ -79,7 +88,10 @@ public class RelayCommand<T> : ICommand
 
         if (parameter is not T typedParam)
         {
-            throw new InvalidOperationException("Paramter is not of the correct type.");
+            throw new InvalidOperationException(
+               "Parameter is not of the correct type.  " +
+               $"Expected type {typeof(T)}.  " +
+               $"Received type {parameter.GetType()}.");
         }
 
         _execute.Invoke(typedParam);

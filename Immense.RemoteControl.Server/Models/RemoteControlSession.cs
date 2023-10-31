@@ -1,11 +1,20 @@
+using Immense.RemoteControl.Server.Enums;
+using Immense.RemoteControl.Server.Services;
 using Immense.RemoteControl.Shared.Helpers;
 
 namespace Immense.RemoteControl.Server.Models;
 
+/// <summary>
+/// Contains data related to a remote control session.  Consuming projects
+/// are expected to derive a class from this and add project-specific properties.
+/// They should add these derived classes to<see cref="IRemoteControlSessionCache"/>
+/// when sessions are created.
+/// </summary>
 public class RemoteControlSession : IDisposable
 {
     private readonly ManualResetEventSlim _sessionReadySignal = new(false);
     private bool _disposedValue;
+    private StreamerState _streamerState;
 
     public RemoteControlSession()
     {
@@ -17,6 +26,7 @@ public class RemoteControlSession : IDisposable
     public string AttendedSessionId { get; set; } = string.Empty;
     public DateTimeOffset Created { get; internal set; }
     public string DesktopConnectionId { get; internal set; } = string.Empty;
+    public DateTimeOffset LastStateChange { get; private set; } = DateTimeOffset.Now;
     public string MachineName { get; internal set; } = string.Empty;
     public RemoteControlMode Mode { get; internal set; }
     /// <summary>
@@ -36,6 +46,21 @@ public class RemoteControlSession : IDisposable
     public bool RequireConsent { get; set; }
 
     public DateTimeOffset StartTime { get; internal set; }
+
+    /// <summary>
+    /// Current state of the streamer (desktop process) that's associated
+    /// with this session.
+    /// </summary>
+    public StreamerState StreamerState
+    {
+        get => _streamerState;
+        set
+        {
+            _streamerState = value;
+            LastStateChange = DateTimeOffset.Now;
+        }
+    }
+
     public Guid StreamId { get; internal set; }
     public Guid UnattendedSessionId { get; set; }
     public string UserConnectionId { get; set; } = string.Empty;

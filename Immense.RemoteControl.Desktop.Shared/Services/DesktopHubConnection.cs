@@ -1,12 +1,14 @@
 ﻿using Immense.RemoteControl.Desktop.Shared.Abstractions;
 using Immense.RemoteControl.Desktop.Shared.Messages;
+using Immense.RemoteControl.Desktop.Shared.Native.Windows;
 using Immense.RemoteControl.Shared;
 using Immense.RemoteControl.Shared.Enums;
+using Immense.RemoteControl.Shared.Interfaces;
 using Immense.RemoteControl.Shared.Models;
+using Immense.SimpleMessenger;
 using Microsoft.AspNetCore.SignalR.Client;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
-using Immense.SimpleMessenger;
 using System.Diagnostics;
 
 namespace Immense.RemoteControl.Desktop.Shared.Services;
@@ -24,7 +26,6 @@ public interface IDesktopHubConnection
     Task DisconnectViewer(IViewer viewer, bool notifyViewer);
     Task<string> GetSessionID();
     Task NotifyRequesterUnattendedReady();
-    Task NotifySessionChanged(SessionSwitchReasonEx reason, int currentSessionId);
     Task NotifyViewersRelaunchedScreenCasterReady(string[] viewerIDs);
     Task SendAttendedSessionInfo(string machineName);
 
@@ -36,7 +37,7 @@ public interface IDesktopHubConnection
     Task<Result> SendUnattendedSessionInfo(string sessionId, string accessKey, string machineName, string requesterName, string organizationName);
 }
 
-public class DesktopHubConnection : IDesktopHubConnection
+public class DesktopHubConnection : IDesktopHubConnection, IDesktopHubClient
 {
     private readonly IAppState _appState;
 
@@ -105,9 +106,9 @@ public class DesktopHubConnection : IDesktopHubConnection
                 return false;
             }
 
-            Connection = result.Value!;
+            Connection = result.Value;
 
-            ApplyConnectionHandlers(result.Value!);
+            ApplyConnectionHandlers(Connection);
 
             var sw = Stopwatch.StartNew();
             while (!cancellationToken.IsCancellationRequested)
@@ -164,6 +165,12 @@ public class DesktopHubConnection : IDesktopHubConnection
         }
     }
 
+    public async Task Disconnect(string reason)
+    {
+        _logger.LogInformation("Disconnecting caster socket.  Reason: {reason}", reason);
+        await DisconnectAllViewers();
+    }
+
     public async Task DisconnectAllViewers()
     {
         foreach (var viewer in _appState.Viewers.Values.ToList())
@@ -182,6 +189,37 @@ public class DesktopHubConnection : IDesktopHubConnection
         viewer.DisconnectRequested = true;
         viewer.Dispose();
         return Connection.SendAsync("DisconnectViewer", viewer.ViewerConnectionId, notifyViewer);
+    }
+
+    public Task GetScreenCast(
+        string viewerId,
+        string requesterName,
+        bool notifyUser,
+        Guid streamId)
+    {
+        // We don't want to tie up the invocation from the server, so we'll
+        // start this in a new task.
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await using var screenCaster = _serviceProvider.GetRequiredService<IScreenCaster>();
+                await screenCaster.BeginScreenCasting(
+                    new ScreenCastRequest()
+                    {
+                        NotifyUser = notifyUser,
+                        ViewerId = viewerId,
+                        RequesterName = requesterName,
+                        StreamId = streamId
+                    });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error while casting screen.");
+            }
+        });
+
+        return Task.CompletedTask;
     }
 
     public async Task<string> GetSessionID()
@@ -204,15 +242,6 @@ public class DesktopHubConnection : IDesktopHubConnection
         return Connection.SendAsync("NotifyRequesterUnattendedReady");
     }
 
-    public Task NotifySessionChanged(SessionSwitchReasonEx reason, int currentSessionId)
-    {
-        if (Connection is null)
-        {
-            return Task.CompletedTask;
-        }
-
-        return Connection.SendAsync("NotifySessionChanged", reason, currentSessionId);
-    }
 
     public Task NotifyViewersRelaunchedScreenCasterReady(string[] viewerIDs)
     {
@@ -222,6 +251,44 @@ public class DesktopHubConnection : IDesktopHubConnection
         }
 
         return Connection.SendAsync("NotifyViewersRelaunchedScreenCasterReady", viewerIDs);
+    }
+
+    public async Task<PromptForAccessResult> PromptForAccess(RemoteControlAccessRequest accessRequest)
+    {
+        try
+        {
+            // TODO: Add this to Win32Interop service/interface when it's
+            // extracted from current static class.
+            if (OperatingSystem.IsWindows() &&
+                Shlwapi.IsOS(OsType.OS_ANYSERVER) &&
+                Process.GetCurrentProcess().SessionId == Kernel32.WTSGetActiveConsoleSessionId())
+            {
+                // Bypass "consent prompt" if we're targeting the console session
+                // on a Windows Server OS.
+                return PromptForAccessResult.Accepted;
+            }
+            await SendMessageToViewer(accessRequest.ViewerConnectionId, "Asking user for permission");
+            return await _remoteControlAccessService.PromptForAccess(
+                accessRequest.RequesterDisplayName,
+                accessRequest.OrganizationName);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error while applying connection handlers.");
+            return PromptForAccessResult.Error;
+        }
+    }
+
+    public Task RequestScreenCast(string viewerId, string requesterName, bool notifyUser, Guid streamId)
+    {
+        _appState.InvokeScreenCastRequested(new ScreenCastRequest()
+        {
+            NotifyUser = notifyUser,
+            ViewerId = viewerId,
+            RequesterName = requesterName,
+            StreamId = streamId
+        });
+        return Task.CompletedTask;
     }
 
     public Task SendAttendedSessionInfo(string machineName)
@@ -250,8 +317,15 @@ public class DesktopHubConnection : IDesktopHubConnection
         {
             return Task.CompletedTask;
         }
-
         return Connection.SendAsync("SendConnectionRequestDenied", viewerID);
+    }
+
+    public async Task SendDtoToClient(byte[] dtoWrapper, string viewerConnectionId)
+    {
+        if (_appState.Viewers.TryGetValue(viewerConnectionId, out var viewer))
+        {
+            await _messageHandler.ParseMessage(viewer, dtoWrapper);
+        }
     }
 
     public Task SendDtoToViewer<T>(T dto, string viewerId)
@@ -285,6 +359,21 @@ public class DesktopHubConnection : IDesktopHubConnection
         return await Connection.InvokeAsync<Result>("ReceiveUnattendedSessionInfo", unattendedSessionId, accessKey, machineName, requesterName, organizationName);
     }
 
+    public async Task ViewerDisconnected(string viewerId)
+    {
+        if (Connection is null)
+        {
+            return;
+        }
+
+        await Connection.SendAsync("DisconnectViewer", viewerId, false);
+        if (_appState.Viewers.TryRemove(viewerId, out var viewer))
+        {
+            viewer.DisconnectRequested = true;
+            viewer.Dispose();
+        }
+        _appState.InvokeViewerRemoved(viewerId);
+    }
 
     private void ApplyConnectionHandlers(HubConnection connection)
     {
@@ -294,87 +383,13 @@ public class DesktopHubConnection : IDesktopHubConnection
             return Task.CompletedTask;
         };
 
-        connection.On("Disconnect", async (string reason) =>
-        {
-            _logger.LogInformation("Disconnecting caster socket.  Reason: {reason}", reason);
-            await DisconnectAllViewers();
-        });
-
-        connection.On("GetScreenCast", async (
-            string viewerID,
-            string requesterName,
-            bool notifyUser,
-            bool enforceAttendedAccess,
-            string organizationName,
-            Guid streamId) =>
-        {
-            try
-            {
-                if (enforceAttendedAccess)
-                {
-                    await SendMessageToViewer(viewerID, "Asking user for permission");
-
-                    var result = await _remoteControlAccessService.PromptForAccess(requesterName, organizationName);
-
-                    if (!result)
-                    {
-                        await SendConnectionRequestDenied(viewerID);
-                        return;
-                    }
-                }
-
-                // We don't want to tie up the invocation from the server, so we'll
-                // start this in a new task.
-                _ = Task.Run(async () =>
-                {
-                    using var screenCaster = _serviceProvider.GetRequiredService<IScreenCaster>();
-                    await screenCaster.BeginScreenCasting(
-                        new ScreenCastRequest()
-                        {
-                            NotifyUser = notifyUser,
-                            ViewerId = viewerID,
-                            RequesterName = requesterName,
-                            StreamId = streamId
-                        });
-                });
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error while applying connection handlers.");
-            }
-        });
-
-
-        connection.On("RequestScreenCast", (string viewerID, string requesterName, bool notifyUser, Guid streamId) =>
-        {
-            _appState.InvokeScreenCastRequested(new ScreenCastRequest()
-            {
-                NotifyUser = notifyUser,
-                ViewerId = viewerID,
-                RequesterName = requesterName,
-                StreamId = streamId
-            });
-        });
-
-        connection.On("SendDtoToClient", (byte[] dtoWrapper, string viewerConnectionId) =>
-        {
-            if (_appState.Viewers.TryGetValue(viewerConnectionId, out var viewer))
-            {
-                _messageHandler.ParseMessage(viewer, dtoWrapper);
-            }
-        });
-
-        connection.On("ViewerDisconnected", async (string viewerID) =>
-        {
-            await connection.SendAsync("DisconnectViewer", viewerID, false);
-            if (_appState.Viewers.TryRemove(viewerID, out var viewer))
-            {
-                viewer.DisconnectRequested = true;
-                viewer.Dispose();
-            }
-            _appState.InvokeViewerRemoved(viewerID);
-
-        });
+        // TODO: Replace parameters with singular DTOs for both client and server methods.
+        connection.On<string>(nameof(Disconnect), Disconnect);
+        connection.On<string, string, bool, Guid>(nameof(GetScreenCast), GetScreenCast);
+        connection.On<string, string, bool, Guid>(nameof(RequestScreenCast), RequestScreenCast);
+        connection.On<byte[], string>(nameof(SendDtoToClient), SendDtoToClient);
+        connection.On<string>(nameof(ViewerDisconnected), ViewerDisconnected);
+        connection.On<RemoteControlAccessRequest, PromptForAccessResult>(nameof(PromptForAccess), PromptForAccess);
     }
 
     private Result<HubConnection> BuildConnection()
@@ -403,12 +418,38 @@ public class DesktopHubConnection : IDesktopHubConnection
 
     private async Task HandleWindowsSessionChanged(WindowsSessionSwitchedMessage message)
     {
-        await NotifySessionChanged(message.Reason, message.SessionId);
+        try
+        {
+            if (Connection is null)
+            {
+                return;
+            }
+
+            await Connection.SendAsync("NotifySessionChanged", message.Reason, message.SessionId);
+
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error while notifying of session change.");
+        }
     }
 
     private async Task HandleWindowsSessionEnding(WindowsSessionEndingMessage message)
     {
-        await DisconnectAllViewers();
+        try
+        {
+            if (Connection is null)
+            {
+                return;
+            }
+
+            await Connection.SendAsync("NotifySessionEnding", message.Reason);
+
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error while notifying of session ending.");
+        }
     }
     private class RetryPolicy : IRetryPolicy
     {

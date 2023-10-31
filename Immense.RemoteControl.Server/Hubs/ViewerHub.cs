@@ -1,8 +1,11 @@
 using Immense.RemoteControl.Server.Abstractions;
+using Immense.RemoteControl.Server.Enums;
 using Immense.RemoteControl.Server.Filters;
 using Immense.RemoteControl.Server.Models;
 using Immense.RemoteControl.Server.Services;
 using Immense.RemoteControl.Shared;
+using Immense.RemoteControl.Shared.Interfaces;
+using Immense.RemoteControl.Shared.Models;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.Logging;
@@ -10,25 +13,31 @@ using Microsoft.Extensions.Logging;
 namespace Immense.RemoteControl.Server.Hubs;
 
 [ServiceFilter(typeof(ViewerAuthorizationFilter))]
-public class ViewerHub : Hub
+public class ViewerHub : Hub<IViewerHubClient>
 {
-    private readonly IHubContext<DesktopHub> _desktopHub;
-    private readonly IDesktopHubSessionCache _desktopSessionCache;
+    private readonly IHubContext<DesktopHub, IDesktopHubClient> _desktopHub;
+    private readonly IViewerOptionsProvider _viewerOptionsProvider;
+    private readonly ISessionRecordingSink _sessionRecordingSink;
+    private readonly IRemoteControlSessionCache _desktopSessionCache;
     private readonly IHubEventHandler _hubEvents;
     private readonly ILogger<ViewerHub> _logger;
     private readonly IDesktopStreamCache _streamCache;
 
     public ViewerHub(
         IHubEventHandler hubEvents,
-        IDesktopHubSessionCache desktopSessionCache,
+        IRemoteControlSessionCache desktopSessionCache,
         IDesktopStreamCache streamCache,
-        IHubContext<DesktopHub> desktopHub,
+        IHubContext<DesktopHub, IDesktopHubClient> desktopHub,
+        IViewerOptionsProvider viewerOptionsProvider,
+        ISessionRecordingSink sessionRecordingSink,
         ILogger<ViewerHub> logger)
     {
         _hubEvents = hubEvents;
         _desktopSessionCache = desktopSessionCache;
         _streamCache = streamCache;
         _desktopHub = desktopHub;
+        _viewerOptionsProvider = viewerOptionsProvider;
+        _sessionRecordingSink = sessionRecordingSink;
         _logger = logger;
     }
 
@@ -76,7 +85,9 @@ public class ViewerHub : Hub
         }
 
         SessionInfo.ViewerList.Remove(Context.ConnectionId);
-        await _desktopHub.Clients.Client(SessionInfo.DesktopConnectionId).SendAsync("ViewerDisconnected", Context.ConnectionId);
+        await _desktopHub.Clients
+            .Client(SessionInfo.DesktopConnectionId)
+            .ViewerDisconnected(Context.ConnectionId);
 
         SessionInfo = SessionInfo.CreateNew();
         _desktopSessionCache.AddOrUpdate($"{SessionInfo.UnattendedSessionId}", SessionInfo);
@@ -95,7 +106,7 @@ public class ViewerHub : Hub
         if (!sessionResult.IsSuccess)
         {
             _logger.LogError("Timed out while waiting for desktop stream.");
-            await Clients.Caller.SendAsync("ShowMessage", "Request timed out");
+            await Clients.Caller.ShowMessage("Request timed out");
             yield break;
         }
 
@@ -107,10 +118,7 @@ public class ViewerHub : Hub
             yield break;
         }
 
-        // At this point, if RequireConsent is enabled, the user has accepted the request.
-        // We can turn it off for the remainder of the session so that reconnects and session
-        // switches can happen without re-prompting.
-        SessionInfo.RequireConsent = false;
+        SessionInfo.StreamerState = StreamerState.Connected;
 
         try
         {
@@ -126,6 +134,11 @@ public class ViewerHub : Hub
         }
     }
 
+    public async Task<RemoteControlViewerOptions> GetViewerOptions()
+    {
+        return await _viewerOptionsProvider.GetViewerOptions();
+    }
+
     public Task InvokeCtrlAltDel()
     {
         return _hubEvents.InvokeCtrlAltDel(SessionInfo, Context.ConnectionId);
@@ -135,7 +148,9 @@ public class ViewerHub : Hub
     {
         if (!string.IsNullOrWhiteSpace(SessionInfo.DesktopConnectionId))
         {
-            await _desktopHub.Clients.Client(SessionInfo.DesktopConnectionId).SendAsync("ViewerDisconnected", Context.ConnectionId);
+            await _desktopHub.Clients
+                .Client(SessionInfo.DesktopConnectionId)
+                .ViewerDisconnected(Context.ConnectionId);
         }
 
         SessionInfo.ViewerList.Remove(Context.ConnectionId);
@@ -149,7 +164,9 @@ public class ViewerHub : Hub
             return Task.CompletedTask;
         }
 
-        return _desktopHub.Clients.Client(SessionInfo.DesktopConnectionId).SendAsync("SendDtoToClient", dtoWrapper, Context.ConnectionId);
+        return _desktopHub.Clients
+            .Client(SessionInfo.DesktopConnectionId)
+            .SendDtoToClient(dtoWrapper, Context.ConnectionId);
     }
     public async Task<Result> SendScreenCastRequestToDevice(string sessionId, string accessKey, string requesterName)
     {
@@ -200,26 +217,61 @@ public class ViewerHub : Hub
 
         if (SessionInfo.Mode == RemoteControlMode.Unattended)
         {
-            await _desktopHub.Clients.Client(SessionInfo.DesktopConnectionId).SendAsync(
-                "GetScreenCast",
-                Context.ConnectionId,
-                RequesterDisplayName,
-                SessionInfo.NotifyUserOnStart,
-                SessionInfo.RequireConsent,
-                SessionInfo.OrganizationName,
-                SessionInfo.StreamId);
+            if (SessionInfo.RequireConsent)
+            {
+                var request = new RemoteControlAccessRequest(
+                    Context.ConnectionId,
+                    RequesterDisplayName,
+                    SessionInfo.OrganizationName);
+
+                var result = await _desktopHub.Clients
+                    .Client(SessionInfo.DesktopConnectionId)
+                    .PromptForAccess(request);
+
+                if (result != Shared.Enums.PromptForAccessResult.Accepted)
+                {
+                    return Result.Fail($"Access request failed.  Reason: {result}");
+                }
+            }
+
+            SessionInfo.RequireConsent = false;
+
+            await _desktopHub.Clients
+                .Client(SessionInfo.DesktopConnectionId)
+                .GetScreenCast(
+                    Context.ConnectionId,
+                    RequesterDisplayName,
+                    SessionInfo.NotifyUserOnStart,
+                    SessionInfo.StreamId);
         }
         else
         {
             SessionInfo.Mode = RemoteControlMode.Attended;
-            await _desktopHub.Clients.Client(SessionInfo.DesktopConnectionId).SendAsync(
-                "RequestScreenCast", 
-                Context.ConnectionId, 
-                RequesterDisplayName,
-                SessionInfo.NotifyUserOnStart,
-                SessionInfo.StreamId);
+            await _desktopHub.Clients
+                .Client(SessionInfo.DesktopConnectionId)
+                .RequestScreenCast(
+                    Context.ConnectionId,
+                    RequesterDisplayName,
+                    SessionInfo.NotifyUserOnStart,
+                    SessionInfo.StreamId);
         }
 
         return Result.Ok();
+    }
+
+    public async Task StoreSessionRecording(IAsyncEnumerable<byte[]> webmStream)
+    {
+        try
+        {
+            await _sessionRecordingSink.SinkWebmStream(webmStream, SessionInfo);
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogInformation("Session recording stopped for stream {streamId}.", SessionInfo.StreamId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error while storing session recording for stream {streamId}.", SessionInfo.StreamId);
+        }
     }
 }
